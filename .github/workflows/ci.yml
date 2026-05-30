@@ -1,0 +1,62 @@
+name: CI — Lint & Test
+
+on:
+  pull_request:
+    branches:
+      - main
+      - develop
+
+jobs:
+  lint-and-test:
+    name: Lint & Test (${{ matrix.lambda }})
+    runs-on: ubuntu-latest
+
+    strategy:
+      matrix:
+        lambda:
+          - pb-to-ghl
+          - ghl-webhook
+          - ddb-to-pb
+          - retry
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+          cache-dependency-path: src/lambda/${{ matrix.lambda }}/package-lock.json
+
+      - name: Install dependencies
+        working-directory: src/lambda/${{ matrix.lambda }}
+        run: npm ci
+
+      - name: Run linter
+        working-directory: src/lambda/${{ matrix.lambda }}
+        run: npm run lint --if-present
+
+      - name: Run unit tests
+        working-directory: src/lambda/${{ matrix.lambda }}
+        run: npm test
+
+  validate-cloudformation:
+    name: Validate CloudFormation Template
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (read-only for validation)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_CI_ROLE_ARN }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Validate CloudFormation template
+        run: |
+          aws cloudformation validate-template \
+            --template-body file://infrastructure/cloudformation/template.yaml

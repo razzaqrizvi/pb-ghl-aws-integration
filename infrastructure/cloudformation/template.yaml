@@ -1,0 +1,452 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  PB <-> GHL AWS Sync Bridge
+  HIPAA-compliant, serverless, bidirectional sync between
+  Practice Better and GoHighLevel using AWS as a bridge.
+
+# ─── Parameters ───────────────────────────────────────────────────────────────
+Parameters:
+  Environment:
+    Type: String
+    AllowedValues: [dev, staging, prod]
+    Default: dev
+    Description: Deployment environment
+
+  # SSM parameter paths — actual values stored securely in SSM, never here
+  PbApiKeyParamPath:
+    Type: String
+    Default: YOUR_SSM_PATH_PB_API_KEY
+    Description: SSM path for Practice Better API key (SecureString)
+
+  GhlApiKeyParamPath:
+    Type: String
+    Default: YOUR_SSM_PATH_GHL_API_KEY
+    Description: SSM path for GoHighLevel API key (SecureString)
+
+  GhlLocationIdParamPath:
+    Type: String
+    Default: YOUR_SSM_PATH_GHL_LOCATION_ID
+    Description: SSM path for GHL Location ID (SecureString)
+
+  GhlWebhookSecretParamPath:
+    Type: String
+    Default: YOUR_SSM_PATH_GHL_WEBHOOK_SECRET
+    Description: SSM path for GHL webhook shared secret (SecureString)
+
+  AlertEmail:
+    Type: String
+    Default: YOUR_ALERT_EMAIL
+    Description: Email address for CloudWatch alarm notifications
+
+# ─── Resources ────────────────────────────────────────────────────────────────
+Resources:
+
+  # ── KMS Key ─────────────────────────────────────────────────────────────────
+  SyncKmsKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: CMK for DynamoDB and SSM encryption — pb-ghl-sync
+      EnableKeyRotation: true
+      KeyPolicy:
+        Statement:
+          - Sid: AllowRootAccount
+            Effect: Allow
+            Principal:
+              AWS: !Sub arn:aws:iam::${AWS::AccountId}:root
+            Action: kms:*
+            Resource: '*'
+          - Sid: AllowLambdaRoles
+            Effect: Allow
+            Principal:
+              AWS:
+                - !GetAtt PbToGhlRole.Arn
+                - !GetAtt GhlWebhookRole.Arn
+                - !GetAtt DdbToPbRole.Arn
+                - !GetAtt RetryRole.Arn
+            Action:
+              - kms:Decrypt
+              - kms:GenerateDataKey
+            Resource: '*'
+
+  SyncKmsKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Sub alias/pb-ghl-sync-${Environment}
+      TargetKeyId: !Ref SyncKmsKey
+
+  # ── DynamoDB Table ───────────────────────────────────────────────────────────
+  SyncTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub pb-ghl-sync-${Environment}
+      BillingMode: PAY_PER_REQUEST
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      SSESpecification:
+        SSEEnabled: true
+        SSEType: KMS
+        KMSMasterKeyId: !Ref SyncKmsKey
+      AttributeDefinitions:
+        - AttributeName: patientId
+          AttributeType: S
+        - AttributeName: syncStatus
+          AttributeType: S
+        - AttributeName: lastUpdatedAt
+          AttributeType: S
+      KeySchema:
+        - AttributeName: patientId
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: syncStatus-lastUpdatedAt-index
+          KeySchema:
+            - AttributeName: syncStatus
+              KeyType: HASH
+            - AttributeName: lastUpdatedAt
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+
+  # ── SNS Topic for Alarms ─────────────────────────────────────────────────────
+  AlarmTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub pb-ghl-sync-alarms-${Environment}
+      Subscription:
+        - Protocol: email
+          Endpoint: !Ref AlertEmail
+
+  # ── IAM Roles ────────────────────────────────────────────────────────────────
+  PbToGhlRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub pb-ghl-pb-to-ghl-role-${Environment}
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: PbToGhlPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:GetItem
+                  - dynamodb:UpdateItem
+                Resource: !GetAtt SyncTable.Arn
+              - Effect: Allow
+                Action: ssm:GetParameter
+                Resource:
+                  - !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter${PbApiKeyParamPath}
+                  - !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter${GhlApiKeyParamPath}
+                  - !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter${GhlLocationIdParamPath}
+
+  GhlWebhookRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub pb-ghl-ghl-webhook-role-${Environment}
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: GhlWebhookPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:UpdateItem
+                  - dynamodb:GetItem
+                Resource: !GetAtt SyncTable.Arn
+              - Effect: Allow
+                Action: ssm:GetParameter
+                Resource:
+                  - !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter${GhlWebhookSecretParamPath}
+
+  DdbToPbRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub pb-ghl-ddb-to-pb-role-${Environment}
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: DdbToPbPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:Scan
+                  - dynamodb:UpdateItem
+                Resource:
+                  - !GetAtt SyncTable.Arn
+                  - !Sub ${SyncTable.Arn}/index/*
+              - Effect: Allow
+                Action: ssm:GetParameter
+                Resource:
+                  - !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter${PbApiKeyParamPath}
+
+  RetryRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub pb-ghl-retry-role-${Environment}
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: RetryPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:Scan
+                  - dynamodb:UpdateItem
+                Resource:
+                  - !GetAtt SyncTable.Arn
+                  - !Sub ${SyncTable.Arn}/index/*
+              - Effect: Allow
+                Action: ssm:GetParameter
+                Resource:
+                  - !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter${PbApiKeyParamPath}
+                  - !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter${GhlApiKeyParamPath}
+                  - !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter${GhlLocationIdParamPath}
+
+  # ── Lambda Functions ─────────────────────────────────────────────────────────
+  PbToGhlFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub pb-to-ghl-${Environment}
+      Runtime: nodejs22.x
+      Handler: index.handler
+      Role: !GetAtt PbToGhlRole.Arn
+      Timeout: 300
+      MemorySize: 256
+      Environment:
+        Variables:
+          ENVIRONMENT: !Ref Environment
+          SYNC_TABLE_NAME: !Ref SyncTable
+          # Secret name only — actual secret value stored in Secrets Manager
+          PB_SECRET_NAME: YOUR_PB_SECRET_NAME
+      Code:
+        ZipFile: |
+          exports.handler = async () => ({ status: 'placeholder' });
+
+  GhlWebhookFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub ghl-webhook-${Environment}
+      Runtime: nodejs22.x
+      Handler: index.handler
+      Role: !GetAtt GhlWebhookRole.Arn
+      Timeout: 30
+      MemorySize: 128
+      Environment:
+        Variables:
+          ENVIRONMENT: !Ref Environment
+          SYNC_TABLE_NAME: !Ref SyncTable
+          GHL_WEBHOOK_SECRET_PARAM: !Ref GhlWebhookSecretParamPath
+      Code:
+        ZipFile: |
+          exports.handler = async () => ({ statusCode: 200, body: '{"status":"ok"}' });
+
+  DdbToPbFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub ddb-to-pb-${Environment}
+      Runtime: nodejs22.x
+      Handler: index.handler
+      Role: !GetAtt DdbToPbRole.Arn
+      Timeout: 300
+      MemorySize: 256
+      Environment:
+        Variables:
+          ENVIRONMENT: !Ref Environment
+          SYNC_TABLE_NAME: !Ref SyncTable
+          PB_API_KEY_PARAM: !Ref PbApiKeyParamPath
+      Code:
+        ZipFile: |
+          exports.handler = async () => ({ status: 'placeholder' });
+
+  RetryFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub retry-${Environment}
+      Runtime: nodejs22.x
+      Handler: index.handler
+      Role: !GetAtt RetryRole.Arn
+      Timeout: 300
+      MemorySize: 256
+      Environment:
+        Variables:
+          ENVIRONMENT: !Ref Environment
+          SYNC_TABLE_NAME: !Ref SyncTable
+          PB_API_KEY_PARAM: !Ref PbApiKeyParamPath
+          GHL_API_KEY_PARAM: !Ref GhlApiKeyParamPath
+          GHL_LOCATION_ID_PARAM: !Ref GhlLocationIdParamPath
+      Code:
+        ZipFile: |
+          exports.handler = async () => ({ status: 'placeholder' });
+
+  # ── EventBridge Rules ────────────────────────────────────────────────────────
+  PbToGhlSchedule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub pb-to-ghl-schedule-${Environment}
+      Description: Trigger Lambda 1 every 5 minutes — fetch PB patients → GHL
+      ScheduleExpression: rate(5 minutes)
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt PbToGhlFunction.Arn
+          Id: PbToGhlTarget
+
+  PbToGhlSchedulePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref PbToGhlFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt PbToGhlSchedule.Arn
+
+  DdbToPbSchedule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub ddb-to-pb-schedule-${Environment}
+      Description: Trigger Lambda 3 every 5 minutes — push PENDING_TO_PB → PB
+      ScheduleExpression: rate(5 minutes)
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt DdbToPbFunction.Arn
+          Id: DdbToPbTarget
+
+  DdbToPbSchedulePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref DdbToPbFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt DdbToPbSchedule.Arn
+
+  RetrySchedule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub retry-schedule-${Environment}
+      Description: Trigger Retry Lambda every 10 minutes — recover missed records
+      ScheduleExpression: rate(10 minutes)
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt RetryFunction.Arn
+          Id: RetryTarget
+
+  RetrySchedulePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref RetryFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt RetrySchedule.Arn
+
+  # ── API Gateway (GHL Webhook Receiver) ───────────────────────────────────────
+  WebhookApi:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: !Sub pb-ghl-webhook-api-${Environment}
+      Description: Receives GHL contact change webhooks
+
+  WebhookResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref WebhookApi
+      ParentId: !GetAtt WebhookApi.RootResourceId
+      PathPart: webhook
+
+  GhlWebhookResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref WebhookApi
+      ParentId: !Ref WebhookResource
+      PathPart: ghl
+
+  GhlWebhookMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref WebhookApi
+      ResourceId: !Ref GhlWebhookResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${GhlWebhookFunction.Arn}/invocations
+
+  GhlWebhookPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref GhlWebhookFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${WebhookApi}/*/POST/webhook/ghl
+
+  # ── CloudWatch Log Groups ────────────────────────────────────────────────────
+  PbToGhlLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/pb-to-ghl-${Environment}
+      RetentionInDays: 90
+
+  GhlWebhookLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/ghl-webhook-${Environment}
+      RetentionInDays: 90
+
+  DdbToPbLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/ddb-to-pb-${Environment}
+      RetentionInDays: 90
+
+  RetryLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/retry-${Environment}
+      RetentionInDays: 90
+
+# ─── Outputs ──────────────────────────────────────────────────────────────────
+Outputs:
+  WebhookEndpoint:
+    Description: GHL webhook URL — configure this in GoHighLevel
+    Value: !Sub https://${WebhookApi}.execute-api.${AWS::Region}.amazonaws.com/prod/webhook/ghl
+
+  DynamoTableName:
+    Description: DynamoDB sync table name
+    Value: !Ref SyncTable
+
+  KmsKeyArn:
+    Description: KMS CMK ARN used for encryption
+    Value: !GetAtt SyncKmsKey.Arn

@@ -1,0 +1,22 @@
+{
+  "name": "ddb-to-pb",
+  "version": "1.0.0",
+  "description": "Sync Lambda — ddb-to-pb",
+  "main": "index.js",
+  "scripts": {
+    "test": "jest --coverage",
+    "lint": "eslint index.js"
+  },
+  "dependencies": {
+    "@aws-sdk/client-secrets-manager": "^3.0.0",
+    "@aws-sdk/client-dynamodb": "^3.0.0"
+  },
+  "devDependencies": {
+    "jest": "^29.0.0",
+    "eslint": "^8.0.0"
+  },
+  "engines": {
+    "node": ">=22.0.0"
+  },
+  "notes": "No HTTP client dependency needed — native fetch is built into Node.js 22.x"
+}

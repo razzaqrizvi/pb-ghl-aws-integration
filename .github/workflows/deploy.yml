@@ -1,0 +1,143 @@
+name: Deploy
+
+on:
+  push:
+    branches:
+      - main       # → deploys to prod
+      - develop    # → deploys to dev
+
+env:
+  AWS_REGION: ${{ secrets.AWS_REGION }}
+
+jobs:
+  # ─── Determine environment from branch ──────────────────────────────────────
+  set-environment:
+    name: Set Deployment Environment
+    runs-on: ubuntu-latest
+    outputs:
+      environment: ${{ steps.env.outputs.environment }}
+    steps:
+      - name: Resolve environment
+        id: env
+        run: |
+          if [[ "${{ github.ref_name }}" == "main" ]]; then
+            echo "environment=prod" >> $GITHUB_OUTPUT
+          else
+            echo "environment=dev" >> $GITHUB_OUTPUT
+          fi
+
+  # ─── Deploy all Lambda functions ────────────────────────────────────────────
+  deploy-lambdas:
+    name: Deploy Lambdas (${{ needs.set-environment.outputs.environment }})
+    runs-on: ubuntu-latest
+    needs: set-environment
+    environment: ${{ needs.set-environment.outputs.environment }}
+
+    strategy:
+      matrix:
+        lambda:
+          - pb-to-ghl
+          - ghl-webhook
+          - ddb-to-pb
+          - retry
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+          cache-dependency-path: src/lambda/${{ matrix.lambda }}/package-lock.json
+
+      - name: Install production dependencies
+        working-directory: src/lambda/${{ matrix.lambda }}
+        run: npm ci --omit=dev
+
+      - name: Package Lambda
+        working-directory: src/lambda/${{ matrix.lambda }}
+        run: zip -r ../../../${{ matrix.lambda }}.zip .
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Deploy Lambda function
+        run: |
+          aws lambda update-function-code \
+            --function-name ${{ matrix.lambda }}-${{ needs.set-environment.outputs.environment }} \
+            --zip-file fileb://${{ matrix.lambda }}.zip \
+            --region ${{ env.AWS_REGION }}
+
+      - name: Wait for Lambda update to complete
+        run: |
+          aws lambda wait function-updated \
+            --function-name ${{ matrix.lambda }}-${{ needs.set-environment.outputs.environment }} \
+            --region ${{ env.AWS_REGION }}
+
+  # ─── Deploy CloudFormation infrastructure ───────────────────────────────────
+  deploy-infrastructure:
+    name: Deploy CloudFormation (${{ needs.set-environment.outputs.environment }})
+    runs-on: ubuntu-latest
+    needs: set-environment
+    environment: ${{ needs.set-environment.outputs.environment }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Deploy CloudFormation stack
+        run: |
+          aws cloudformation deploy \
+            --template-file infrastructure/cloudformation/template.yaml \
+            --stack-name pb-ghl-sync-${{ needs.set-environment.outputs.environment }} \
+            --parameter-overrides \
+              Environment=${{ needs.set-environment.outputs.environment }} \
+              AlertEmail=${{ secrets.ALERT_EMAIL }} \
+            --capabilities CAPABILITY_NAMED_IAM \
+            --region ${{ env.AWS_REGION }} \
+            --no-fail-on-empty-changeset
+
+  # ─── Smoke test after deploy ─────────────────────────────────────────────────
+  smoke-test:
+    name: Smoke Test (${{ needs.set-environment.outputs.environment }})
+    runs-on: ubuntu-latest
+    needs:
+      - set-environment
+      - deploy-lambdas
+      - deploy-infrastructure
+
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Invoke pb-to-ghl Lambda (dry run)
+        run: |
+          RESULT=$(aws lambda invoke \
+            --function-name pb-to-ghl-${{ needs.set-environment.outputs.environment }} \
+            --payload '{"source":"github-actions","action":"smoke-test"}' \
+            --region ${{ env.AWS_REGION }} \
+            response.json)
+          echo "Lambda response:"
+          cat response.json
+
+      - name: Confirm no errors in smoke test
+        run: |
+          if grep -q '"FunctionError"' response.json; then
+            echo "Smoke test FAILED — Lambda returned an error"
+            exit 1
+          fi
+          echo "Smoke test passed"
