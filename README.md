@@ -190,8 +190,10 @@ Full conventions: [`docs/branching-strategy.md`](docs/branching-strategy.md)
 
 ## Author
 
-**Razzaq Rizvi** AWS Cloud Engineer · Karachi, Pakistan
-Freelance via https://www.upwork.com/freelancers/~014b3c6b713933d19c — serverless integrations and HIPAA-compliant AWS architectures for health & wellness clients in the USA and Canada.
+**Razzaq Rizvi** — Cloud & Infrastructure Engineer
+
+- LinkedIn: <https://www.linkedin.com/in/razzaqrizvi/>
+- GitHub: <https://github.com/razzaqrizvi>
 
 ---
 
